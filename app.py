@@ -2,13 +2,11 @@ from fpdf import FPDF
 import random
 import re
 import time, faiss, numpy as np, pickle, os
-import torch.nn.functional as F
-import torch
 from datetime import datetime
 import streamlit as st
 from streamlit.components.v1 import html as components_html
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import json
 from groq import Groq
 
 st.set_page_config(page_title="Ruang Aman - Konseling Hukum UU TPKS",
@@ -20,26 +18,66 @@ def load_embed(): return SentenceTransformer("sentence-transformers/paraphrase-m
 @st.cache_resource
 def load_store():
     return faiss.read_index("faiss_index.index"), pickle.load(open("chunks.pkl","rb"))
-embed_model = load_embed()
-index, chunks = load_store()
 
-EMOTION_MODEL_REPO = "Chatbot-123/Chatbot-KS"
-@st.cache_resource
-def load_emotion_model():
-    tok = AutoTokenizer.from_pretrained(EMOTION_MODEL_REPO)
-    mdl = AutoModelForSequenceClassification.from_pretrained(EMOTION_MODEL_REPO)
-    mdl.eval()
-    return tok, mdl
+FALLBACK_SUPPORT_SENTENCE = {
+    "sadness": "Aku di sini mendengarkanmu. Ceritakan saja semuanya, ya.",
+    "fear": "Kamu aman di sini. Tarik napas dalam-dalam, kita lalui bersama.",
+    "anger": "Wajar kok kalau kamu kesal. Yuk, rehat sejenak dan tenangin pikiran.",
+    "happy": "Ikut senang mendengarnya! Cerita seru apa lagi nih?",
+    "love": "Terima kasih ya sudah berbagi energi positif. Kamu berharga!",
+}
 
-def detect_emotion(text: str) -> dict:
-    tokenizer, model = load_emotion_model()
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=64)
-    with torch.no_grad():
-        probs = F.softmax(model(**inputs).logits, dim=-1)[0]
-    id2label_local = model.config.id2label
-    scores = {id2label_local[i]: float(probs[i]) for i in range(len(probs))}
-    dominant = max(scores, key=scores.get)
-    return {"label_dominan": dominant, "confidence": scores[dominant], "semua_skor": scores}
+def analyze_emotion_and_support(text: str, api_key: str) -> dict:
+    """1 Groq call yang sekaligus: (1) klasifikasi emosi 5 kelas, dan
+    (2) bikin 1 kalimat support dinamis berdasarkan emosi dominan itu sendiri.
+    Menggantikan 2 call terpisah (detect_emotion + generate_ai_support_label)."""
+    labels = ["sadness", "fear", "anger", "happy", "love"]
+    default_scores = {l: 0.0 for l in labels}
+    default_fallback = "Siap membantu dan mendengarkan ceritamu."
+    if not api_key:
+        return {"label_dominan": "sadness", "confidence": 0.0, "semua_skor": default_scores, "ai_label": default_fallback}
+    system_prompt = (
+        "Kamu adalah asisten yang menganalisis emosi teks Bahasa Indonesia SEKALIGUS "
+        "membuat 1 kalimat respons suportif singkat, dalam satu langkah.\n\n"
+        "LANGKAH 1 - KLASIFIKASI EMOSI:\n"
+        "Klasifikasikan pesan user ke 5 emosi: sadness, fear, anger, happy, love. "
+        "Beri skor keyakinan 0-1 untuk masing-masing (total sekitar 1.0).\n\n"
+        "LANGKAH 2 - KALIMAT SUPPORT (berdasarkan emosi dominan hasil Langkah 1):\n"
+        "- sadness: 1 kalimat sangat lembut, empati mendalam, tunjukkan kamu ada untuknya.\n"
+        "- fear: 1 kalimat menenangkan, berikan kepastian dia aman bercerita di sini.\n"
+        "- anger: 1 kalimat validasi yang adem, turunkan tensi tanpa menghakimi.\n"
+        "- happy: 1 kalimat ikut senang, antusias, apresiasi energi positifnya.\n"
+        "- love: 1 kalimat apresiasi hangat atas kasih sayang/cerita indahnya.\n\n"
+        "ATURAN KALIMAT SUPPORT:\n"
+        "- Maksimal 12-15 kata.\n"
+        "- Bahasa Indonesia santai/kasual, natural seperti teman dekat (jangan kaku/formal).\n"
+        "- DILARANG pakai tanda kutip atau kalimat pengantar seperti 'Ini kalimatnya:'.\n\n"
+        "Balas HANYA dengan JSON valid tanpa teks/markdown lain, format PERSIS:\n"
+        '{"sadness": 0.0, "fear": 0.0, "anger": 0.0, "happy": 0.0, "love": 0.0, "support_sentence": "..."}'
+    )
+    try:
+        client = Groq(api_key=api_key)
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.7,
+            max_tokens=150,
+        )
+        raw = completion.choices[0].message.content.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        data = json.loads(raw)
+        scores = {l: float(data.get(l, 0.0)) for l in labels}
+        dominant = max(scores, key=scores.get)
+        support_sentence = str(data.get("support_sentence", "")).strip()
+        if not support_sentence:
+            support_sentence = FALLBACK_SUPPORT_SENTENCE.get(dominant, default_fallback)
+        return {"label_dominan": dominant, "confidence": scores[dominant], "semua_skor": scores, "ai_label": support_sentence}
+    except Exception:
+        return {"label_dominan": "sadness", "confidence": 0.0, "semua_skor": default_scores,
+                 "ai_label": FALLBACK_SUPPORT_SENTENCE["sadness"]}
 
 
 DISTRESS_MAP = {
@@ -50,8 +88,8 @@ DISTRESS_MAP = {
     "love": "rendah",
 }
 
-def get_support_flag(text: str, threshold: float = 0.5, sadness_safety_threshold: float = 0.30) -> dict:
-    r = detect_emotion(text)
+def get_support_flag(text: str, api_key: str, threshold: float = 0.5, sadness_safety_threshold: float = 0.30) -> dict:
+    r = analyze_emotion_and_support(text, api_key)
     dominant = r["label_dominan"]
     level = DISTRESS_MAP.get(dominant, "rendah")
     if r["confidence"] < threshold:
@@ -65,55 +103,13 @@ def get_support_flag(text: str, threshold: float = 0.5, sadness_safety_threshold
         "sadness_score": sadness_score,
         "distress_level": level,
         "perlu_rujukan": level == "tinggi",
-    }
-def generate_ai_support_label(api_key, emotion: str, user_text: str) -> str:
-    if not api_key:
-        return "Siap membantu dan mendengarkan ceritamu."
-
-    # Arahan spesifik berdasarkan emosi yang terdeteksi
-    instruction_map = {
-        "sadness": "berikan 1 kalimat penguat yang sangat lembut, tunjukkan empati mendalam dan bahwa kamu ada untuknya.",
-        "fear": "berikan 1 kalimat yang menenangkan kekhawatirannya, berikan kepastian bahwa dia aman bercerita di sini.",
-        "anger": "berikan 1 kalimat validasi yang adem untuk menurunkan tensi emosinya tanpa menghakimi kekesalannya.",
-        "happy": "berikan 1 kalimat ikut senang, antusias, dan mengapresiasi kabar baik atau energi positifnya.",
-        "love": "berikan 1 kalimat apresiasi yang hangat atas kasih sayang atau cerita indahnya."
+        "ai_label": r["ai_label"],
     }
 
-    context_instruction = instruction_map.get(emotion, "berikan 1 kalimat respons yang hangat dan suportif.")
 
-    system_prompt = (
-        f"Kamu adalah konselor psikologis yang sangat empatik dan peka. "
-        f"User baru saja bercerita dan sistem mendeteksi emosinya adalah '{emotion}'. "
-        f"Berdasarkan potongan pesannya, {context_instruction}\n\n"
-        "ATURAN MUTLAK:\n"
-        "- HANYA hasilkan 1 kalimat pendek saja (maksimal 12-15 kata).\n"
-        "- Gunakan bahasa Indonesia santai/kasual yang sangat natural seperti teman dekat (jangan kaku/formal).\n"
-        "- DILARANG memakai tanda kutip atau kalimat pengantar seperti 'Ini kalimatnya:'."
-    )
-
-    try:
-        client = Groq(api_key=api_key)
-        # Gunakan model 8B agar super cepat (low latency)
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Pesan user: {user_text}"}
-            ],
-            temperature=0.85,
-            max_tokens=50
-        )
-        return completion.choices[0].message.content.strip()
-    except Exception:
-        # Fallback (cadangan) jika API Groq mendadak error/limit
-        fallback = {
-            "sadness": "Aku di sini mendengarkanmu. Ceritakan saja semuanya, ya.",
-            "fear": "Kamu aman di sini. Tarik napas dalam-dalam, kita lalui bersama.",
-            "anger": "Wajar kok kalau kamu kesal. Yuk, rehat sejenak dan tenangin pikiran.",
-            "happy": "Ikut senang mendengarnya! Cerita seru apa lagi nih?",
-            "love": "Terima kasih ya sudah berbagi energi positif. Kamu berharga!"
-        }
-        return fallback.get(emotion, "Siap membantu")
+TYPING_INDICATOR_HTML = """
+<div class="typing-indicator"><span></span><span></span><span></span></div>
+"""
 
 
 SUPPORT_MESSAGES = {
@@ -719,6 +715,108 @@ def inject_css(t):
         color: {t['navy']};
         line-height: 1.6;
     }}
+
+    /* ============================================================ */
+    /* RESPONSIVE MOBILE — layar sempit (hp/tablet portrait)         */
+    /* ============================================================ */
+    @media (max-width: 640px) {{
+        .block-container {{
+            padding-left: 12px !important;
+            padding-right: 12px !important;
+            padding-top: 0.8rem !important;
+        }}
+        .glass-panel {{
+            padding: 14px 12px 6px !important;
+            border-radius: 18px !important;
+        }}
+        /* Header utama — kecilkan logo & judul */
+        .main-chat-header {{ margin: 2px 0 12px; }}
+        .main-chat-header .logo-badge {{
+            width: 44px !important; height: 44px !important; margin-bottom: 8px !important;
+        }}
+        .main-chat-header .logo-badge svg {{ width: 22px !important; height: 22px !important; }}
+        .main-chat-header .title {{ font-size: 22px !important; }}
+        .main-chat-header .subtitle {{ font-size: 12.5px !important; }}
+        /* Grid 6 fitur — 2 kolom lebih enak digenggam daripada 3 sempit */
+        .st-key-fitur_grid [data-testid="stHorizontalBlock"] {{
+            flex-wrap: wrap !important;
+        }}
+        .st-key-fitur_grid [data-testid="column"] {{
+            flex: 1 1 46% !important;
+            min-width: 46% !important;
+        }}
+        .st-key-fitur_grid div.stButton > button {{
+            height: 78px !important;
+        }}
+        .st-key-fitur_grid div.stButton > button p {{
+            font-size: 12px !important;
+        }}
+        /* Bubble chat — full width & teks lebih rapat */
+        [data-testid="stChatMessageContent"] {{
+            max-width: 88vw !important;
+            padding: 11px 14px !important;
+        }}
+        [data-testid="stChatMessageContent"] p, [data-testid="stChatMessageContent"] li {{
+            font-size: 13.5px !important;
+        }}
+        /* Chip saran — biar wrap rapi, nggak kepotong */
+        .st-key-chip_row [data-testid="stHorizontalBlock"] {{
+            flex-wrap: wrap !important;
+            gap: 8px !important;
+        }}
+        .st-key-chip_row [data-testid="column"] {{
+            flex: 1 1 100% !important;
+            min-width: 100% !important;
+            width: 100% !important;
+        }}
+        .st-key-chip_row div.stButton > button {{
+            padding: 8px 14px !important;
+            font-size: 12.5px !important;
+        }}
+        /* Tombol darurat — perkecil & pas di layar kecil */
+        div.st-key-panic_component {{
+            top: 8px !important;
+            right: 10px !important;
+            width: 128px !important;
+            height: 38px !important;
+        }}
+        /* Input chat & container bawah — padding lebih hemat */
+        div[data-testid="stBottomBlockContainer"] {{
+            padding-left: 12px !important;
+            padding-right: 12px !important;
+        }}
+        [data-testid="stChatInput"] textarea {{
+            font-size: 16px !important; /* cegah auto-zoom Safari/Chrome iOS saat fokus input */
+        }}
+        /* Sidebar — kecilkan logo & judul brand */
+        .sidebar-logo {{ width: 44px !important; height: 44px !important; }}
+        .sidebar-logo svg {{ width: 22px !important; height: 22px !important; }}
+        .sidebar-brand-title {{ font-size: 17px !important; }}
+        .sidebar-brand-sub {{ font-size: 11px !important; }}
+    }}
+
+    /* ============ TYPING INDICATOR — animasi "sedang mengetik" ============ */
+    .typing-indicator {{
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 6px 2px;
+    }}
+    .typing-indicator span {{
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background-color: {t['bot_text']};
+        opacity: 0.35;
+        animation: typing-bounce 1.1s infinite ease-in-out;
+    }}
+    .typing-indicator span:nth-child(1) {{ animation-delay: 0s; }}
+    .typing-indicator span:nth-child(2) {{ animation-delay: 0.15s; }}
+    .typing-indicator span:nth-child(3) {{ animation-delay: 0.3s; }}
+    @keyframes typing-bounce {{
+        0%, 60%, 100% {{ transform: translateY(0); opacity: 0.35; }}
+        30% {{ transform: translateY(-6px); opacity: 1; }}
+    }}
     </style>""", unsafe_allow_html=True)
 
 FITUR = [
@@ -745,6 +843,9 @@ MENU_LABELS = {"konseling": "Konseling", "pasal": "Telusur Pasal", "lapor": "Pan
 
 THRESHOLD = 0.5
 def retrieve(query, k=4, th=THRESHOLD):
+    embed_model = load_embed()
+    index, chunks = load_store()
+
     m = re.search(r"pasal\s+(\d{1,3})\b", query, re.IGNORECASE)
     exact_ctx = []
     if m:
@@ -862,7 +963,7 @@ def groq_answer(api_key, user_input, history, mode, support_info):
 
     user_msg = f"PERTANYAAN PENGGUNA:\n{user_input}\n\nKONTEKS PASAL UU TPKS (relevansi {sim:.0%}):\n{context}"
     msgs = [{"role": "system", "content": system_prompt}]
-    for h in history[-6:]:
+    for h in history[-2:]:
         msgs.append({"role": h["role"], "content": h["content"]})
     msgs.append({"role": "user", "content": user_msg})
 
@@ -1247,20 +1348,22 @@ if user_input:
     with st.chat_message("user", avatar="👤"):
         st.markdown(user_input)
 
-    # 1. Deteksi emosi dasar dari model lokal
-    support_info = get_support_flag(user_input)
-
-    # 2. Panggil AI untuk membuat kalimat support dinamis yang unik
-    ai_dynamic_label = generate_ai_support_label(api_key, support_info["emosi"], user_input)
-
-    # 3. Simpan hasilnya ke session state (termasuk kalimat dari AI tadi)
-    st.session_state["last_emotion_result"] = {
-        "label_dominan": support_info["emosi"],
-        "confidence": support_info["confidence"],
-        "ai_label": ai_dynamic_label
-    }
-
     with st.chat_message("assistant", avatar="\U0001f49b"):
+        typing_ph = st.empty()
+        typing_ph.markdown(TYPING_INDICATOR_HTML, unsafe_allow_html=True)
+
+        # 1. Deteksi emosi + kalimat support dinamis sekaligus (1 Groq call)
+        support_info = get_support_flag(user_input, api_key)
+
+        # 2. Simpan hasilnya ke session state
+        st.session_state["last_emotion_result"] = {
+            "label_dominan": support_info["emosi"],
+            "confidence": support_info["confidence"],
+            "ai_label": support_info["ai_label"]
+        }
+
+        typing_ph.empty()
+
         banner_text = None
         if support_info["perlu_rujukan"]:
             banner_text = get_support_banner(support_info["emosi"])
