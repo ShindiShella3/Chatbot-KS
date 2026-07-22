@@ -1282,5 +1282,3 @@ if user_input:
                 st.markdown(ans)
     st.session_state.messages.append({"role": "assistant", "content": ans, "time": datetime.now()})
     st.rerun()
-
-ini kalau saya nggak pakai emotion gimana? emotionnya biar di terjemahkan groq
